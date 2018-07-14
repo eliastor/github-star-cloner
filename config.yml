@@ -1,0 +1,4 @@
+token: "your github auth token"
+workers: 7
+path: './github.com/'
+retries: 3

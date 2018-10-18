@@ -1,112 +1,126 @@
 package main
 
 import (
+	"io/ioutil"
+	//"golang.org/x/crypto/ssh"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/go-github/github"
+    "github.com/eliastor/github-star-cloner/types"
+	"github.com/eliastor/github-star-cloner/provider"
+	"github.com/eliastor/github-star-cloner/provider/github.com"
+	//Plans:
+	//"github.com/eliastor/github-star-cloner/provider/gitlab.com"
+	//"github.com/eliastor/github-star-cloner/provider/bitbucket.com"
+	//"github.com/eliastor/github-star-cloner/provider/gogs"
+
+	"gopkg.in/src-d/go-git.v4/plumbing/transport"
+	githttp "gopkg.in/src-d/go-git.v4/plumbing/transport/http"
+	gitssh "gopkg.in/src-d/go-git.v4/plumbing/transport/ssh"
+
 	"github.com/heetch/confita"
 	"github.com/heetch/confita/backend/file"
 	"github.com/heetch/confita/backend/flags"
-	"golang.org/x/oauth2"
-	git "gopkg.in/src-d/go-git.v4"
-
+	
 	"github.com/pkg/profile"
 )
 
 const (
-	configPath = "./config.yml"
+	configPath = "config.yml"
 )
 
-var conf = config{
-	Token:   "",
-	Workers: 5,
-	Path:    `./github/`,
-	Retries: 5,
-}
-
-type repo struct {
-	cloneHTTP   string
-	cloneSSH    string
-	fullName    string
-	description string
-
-	output string
-
-	cloned  bool
-	errored bool
-}
-
 type config struct {
-	Token   string              `config:"token,required"`
+	Github   string              `config:"github"`
+	//Gitlab	 string              `config:"gitlab"`
+	//Bitbucket	 string              `config:"bitbucket"`
+	providers map[string]provider.Provider
+	gitAuth map[string]transport.AuthMethod
 	Path    string              `config:"path"`
 	Workers int                 `config:"workers"`
 	Retries int                 `config:"retries"`
 	Skip    map[string]struct{} `config:"skip"`
+	writeConfig bool `config:"s"`
 }
 
-//TODO: refactor this mess
-func clone(httpURL string, path string, progressWriter io.Writer) (status string, err error) {
-	_, err = git.PlainClone(path, false, &git.CloneOptions{
-		URL:               httpURL,
-		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
-		Progress:          progressWriter,
-		NoCheckout:        true,
-	})
-	if err != nil {
-		if err == git.ErrRepositoryAlreadyExists {
-			r, err := git.PlainOpen(path) //ErrRepositoryNotExists
-			if err != nil {
-				return "", err
-			}
-			err = r.Fetch(&git.FetchOptions{Progress: progressWriter})
-			if err != nil {
-				if err == git.NoErrAlreadyUpToDate {
-					return err.Error(), nil
-				} else {
-					return "", err
-				}
-			}
-		} else {
-			return "", err
-		}
+var conf = config{
+	Github:   "",
+	providers: make(map[string]provider.Provider),
+	gitAuth: make(map[string]transport.AuthMethod),
+	Workers: 5,
+	Path:    `./`,
+	Retries: 3,
+	Skip: make(map[string]struct{}, 0),
+}
+
+type Job struct {
+	Args []interface{}
+	err error
+}
+
+type ExtendedJob struct {
+	Job
+	Returns []interface{}
+
+	createTime time.Time
+	startTime time.Time
+	endTime time.Time
+	doneJobs chan<- *Job
+	errJobs chan<- *Job
+	id string
+	workerAssigned string
+	critical bool
+}
+
+func authMatcher(p provider.Authenticator) (transport.AuthMethod){
+	var am transport.AuthMethod
+	switch p.Name(){
+	case "token":
+		a:= new(githttp.TokenAuth)
+		a.Token = p.Value()
+		am = a
+	case "basic":
+		a := new(githttp.BasicAuth)
+		a.Username = p.Values()[0]
+		a.Password = p.Values()[1]
+		am = a
+	case "key":
+		a,_ := gitssh.NewPublicKeys(p.Values()[0], []byte(p.Values()[1]), p.Values()[2])
+		am = a
 	}
-	return "Cloned", nil
+	return am
 }
 
-func cloner(jobs <-chan repo, doneJobs, errJobs chan<- repo, path string) {
+func cloner(jobs <-chan types.Repository, doneJobs, errJobs chan<- types.Repository, path string) {
 	bw := new(strings.Builder)
 	for job := range jobs {
-		name := job.fullName
+		name := job.Name
 		activeJobs.Store(name, nil)
 		//timeWatchProbe(name)
 
 		bw.WriteString(name)
 		bw.WriteString(": ")
-		status, err := clone(job.cloneHTTP, path+name, nil)
+
+		status, err := clone(job.URL, path+name, conf.gitAuth["github"], nil)
 		if err != nil {
-			job.errored = true
 			//timeWatchProbe(name)
-			bw.WriteString(err.Error())
-			job.output = bw.String()
-			errJobs <- job
+			//bw.WriteString(err.Error())
+			//job.output = bw.String()
+			//errJobs <- job
 		} else {
 			//timeWatchProbe(name)
 			bw.WriteString(status)
 			bw.WriteString(" in ")
 			bw.WriteString(timewatchGet(name).String())
-			job.output = bw.String()
-			job.cloned = true
-			job.errored = false
+			//job.output = bw.String()
+			//job.cloned = true
+			//job.errored = false
 
 			doneJobs <- job
 		}
@@ -211,60 +225,62 @@ func timeWatcherStop() {
 	close(timeWatcher.ch)
 }
 
-//TODO: refactor this mess
-func getStarredRepos(token string, perPage int) (cloneReps []repo, err error) {
-	cloneReps = make([]repo, 0, 50)
-	ts := oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: token},
-	)
-	ctx, ctxCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer ctxCancel()
+func parseConfig(conf *config) (err error) {
 
-	tc := oauth2.NewClient(ctx, ts)
+	if conf.Github != "" {
+		var auth provider.Authenticator
 
-	gclient := github.NewClient(tc)
+		sep := strings.SplitN(conf.Github, ":", 2)
+		method := sep[0]
+		value := sep[1]
+			
+		switch method{
+		case "ssh":
+			sep :=strings.SplitN(value, ":", 2)
+			path := sep[0]
+			user:=""
+			if len(sep)>1{
+				user = sep[1]
+			}
 
-	opts := new(github.ActivityListStarredOptions)
-
-	opts.PerPage = perPage
-	opts.Page = 1
-
-	for {
-		repos, resp, err := gclient.Activity.ListStarred(ctx, "", opts)
-		if _, ok := err.(*github.RateLimitError); ok || resp.StatusCode != http.StatusOK {
-			//hit rate limit
-			fmt.Print("*")
-			time.Sleep(1 * time.Second)
+			fileinfo, err := os.Stat(path)
+			if err != nil {
+				return errors.New(fmt.Sprint("Wrong github config: unable to find ssh key",value))
+			}
+			
+			if !fileinfo.IsDir(){
+				return errors.New(fmt.Sprint("Wrong github config:", value, "is directory"))
+			}
+			fp,err := os.Open(path)
+			defer fp.Close()
+			key, err := ioutil.ReadAll(fp)
+			auth = provider.NewAuthKey(user, key, "")
+		case "token":
+			token := value
+			auth = provider.NewAuthToken(token)
+		case "basic":
+			/*sep :=strings.SplitN(value, ":", 2)
+			user := sep[0]
+			pass:=""
+			if len(sep)>1{
+				pass = sep[1]
+			}
+			*/
 		}
 
+		gitconfig := github.Config {
+			Ctx: context.TODO(),
+			PreferSSH: false,
+			Auth: auth,
+		}
+		prov,err := provider.NewProvider("github", gitconfig)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		opts.Page++
-		if len(repos) == 0 {
-			break
-		}
-		for _, srep := range repos {
-			rep := *new(repo)
-			starredRep := *srep.GetRepository()
-			rep.cloneHTTP = starredRep.GetCloneURL()
-			rep.cloneSSH = starredRep.GetSSHURL()
-			rep.fullName = starredRep.GetFullName()
-			rep.description = starredRep.GetDescription()
-			fmt.Print(".")
-			cloneReps = append(cloneReps, rep)
-		}
-		if resp.NextPage == 0 {
-			break
-		}
+		conf.providers["github"]=prov
+		conf.gitAuth["github"]=authMatcher(auth)
 	}
-	return
-}
 
-func configCheck(conf *config) (err error) {
-	if conf.Token == "" {
-		err = errors.New("No Github token specified")
-	}
 	if conf.Workers < 1 {
 		conf.Workers = 1
 	} else if conf.Workers > 32 {
@@ -275,46 +291,52 @@ func configCheck(conf *config) (err error) {
 }
 
 func init() {
-	conf.Skip = make(map[string]struct{}, 0)
-	cfgLoader := new(confita.Loader)
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		cfgLoader = confita.NewLoader(
-			file.NewBackend(configPath),
-		)
-	} else {
-		cfgLoader = confita.NewLoader(
-			file.NewBackend(configPath),
-		)
-	}
-	cfgLoader = confita.NewLoader(
-		flags.NewBackend(),
-	)
-	err := cfgLoader.Load(context.Background(), &conf)
-	if err != nil {
-		log.Fatal("Failed to load config: ", err.Error())
-	}
-	if configCheck(&conf) != nil {
-		log.Fatal("Wrong config", err.Error())
-	}
-
 }
 
 var activeJobs sync.Map
 
 func main() {
-	//defer profile.Start().Stop()
 	defer profile.Start(profile.MemProfile).Stop()
 
-	starredrepos, err := getStarredRepos(conf.Token, 50)
-	if err != nil {
-		log.Fatal(err.Error())
+	cfgLoader := new(confita.Loader)
+	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
+		cfgLoader = confita.NewLoader(
+			file.NewBackend(configPath),
+		)
+	} else {
+		cfgLoader = confita.NewLoader(
+			flags.NewBackend(),
+		)
 	}
-	fmt.Println()
-	if len(starredrepos) == 0 {
-		fmt.Println("Nothing to clone. There is no starred repos")
+	err := cfgLoader.Load(context.Background(), &conf)
+	if err != nil {
+		log.Fatal("Failed to load config: ", err.Error())
+	}
+	if parseConfig(&conf) != nil {
+		log.Fatal("Wrong config", err.Error())
 	}
 
-	erroredrepos := make([]repo, 0)
+	var repos []types.Repository
+
+	if len(conf.providers) ==0 {
+		fmt.Println("No credentials provided")
+	}else{
+		for key := range conf.providers {
+			reps, err := conf.providers[key].Starred()
+			if err != nil {
+				fmt.Println("Error occured during", key, "usage:", err)
+				continue
+			}else{
+				repos = append(repos, reps...)	
+			}
+		}
+	}
+	
+	if len(repos) == 0 {
+		fmt.Println("No repos to operate.")
+	}
+
+	erroredrepos := make([]types.Repository, 0)
 
 	wg := new(sync.WaitGroup)
 
@@ -322,9 +344,10 @@ func main() {
 		timeWatcherServe(3 * time.Second)
 	}()
 
-	jobs := make(chan repo, 50)
-	errJobs := make(chan repo, 50)
-	okJobs := make(chan repo, 50)
+	jobs := make(chan types.Repository, 50)
+	errJobs := make(chan types.Repository, 50)
+	okJobs := make(chan types.Repository, 50)
+
 	for i := 0; i < conf.Workers; i++ {
 		go func() {
 			wg.Add(1)
@@ -334,7 +357,7 @@ func main() {
 	}
 	fmt.Println(conf.Workers, "workers started")
 
-	go func(jobs chan<- repo, okJobs <-chan repo) {
+	go func(jobs chan<- types.Repository, okJobs <-chan types.Repository) {
 		listFile, err := os.OpenFile(conf.Path+"repos.lst", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 660)
 		defer func() {
 			listFile.Sync()
@@ -343,32 +366,32 @@ func main() {
 			}
 		}()
 		for job := range okJobs {
-			fmt.Println(job.output)
-			listFile.WriteString(job.fullName)
+			listFile.WriteString(job.Name)
 			listFile.WriteString(": ")
-			listFile.WriteString(job.description)
+			listFile.WriteString(job.Descrition)
 			listFile.WriteString("\n")
+			fmt.Println(job.Name)
 		}
 		return
 	}(jobs, okJobs)
 
-	go func(jobs chan<- repo, errJobs <-chan repo, errRepos []repo) {
+	go func(jobs chan<- types.Repository, errJobs <-chan types.Repository, errRepos []types.Repository) {
 		if conf.Retries == 0 {
 			return
 		}
 		if errRepos == nil {
-			errRepos = make([]repo, 0)
+			errRepos = make([]types.Repository, 0)
 		}
 		retries := make(map[string]int, 50)
 		for job := range errJobs {
-			name := job.fullName
+			name := job.Name
 			cnt, ok := retries[name]
 			if !ok {
 				cnt = 2
 				retries[name] = cnt
 			}
 			if cnt <= conf.Retries {
-				fmt.Println(name, "Try", cnt, "/", conf.Retries, ":", job.output)
+				fmt.Println(name, "Try", cnt, "/", conf.Retries)
 				jobs <- job
 			} else {
 				fmt.Println(name, "failed")
@@ -377,13 +400,13 @@ func main() {
 		}
 	}(jobs, errJobs, erroredrepos)
 
-	for _, cloneRep := range starredrepos {
-		if _, ok := conf.Skip[cloneRep.fullName]; ok {
-			fmt.Println(cloneRep.fullName, ": Skipped")
+	for _, rep := range repos {
+		if _, ok := conf.Skip[rep.Name]; ok {
+			fmt.Println(rep.Name, ": Skipped")
 			continue
 		}
 
-		jobs <- cloneRep
+		jobs <- rep
 	}
 	fmt.Println("All jobs sended")
 
@@ -407,7 +430,7 @@ func main() {
 	if len(erroredrepos) > 0 {
 		fmt.Println("Some repos are not cloned/updated:")
 		for _, errrepo := range erroredrepos {
-			fmt.Println(errrepo.fullName)
+			fmt.Println(errrepo.Name)
 		}
 	}
 }

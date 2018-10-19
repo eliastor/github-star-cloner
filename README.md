@@ -21,7 +21,7 @@ go build .
 optionally you can install git-cloner with `go install github.com/eliastor/github-star-cloner`
 
 ## Usage
-First of all [create personal access token](https://github.com/settings/tokens/new) on GitHub. You don't need to select any additional permissions. BTW you can this token something like `git-cloner`. Click on "Generate token" and you'll get string like `27f20f373a59d8d0717ec0bfa424189f7df5ce4e`.
+First of all [create personal access token](https://github.com/settings/tokens/new) on GitHub. You don't need to select any additional permissions. BTW you can name this token something like `git-cloner`. Click on "Generate token" and you'll get string like `27f20f373a59d8d0717ec0bfa424189f7df5ce4e`.
 
 Folow to directory where you want store your repositories and do
 ```

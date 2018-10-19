@@ -76,15 +76,20 @@ type ExtendedJob struct {
 	id string
 	workerAssigned string
 	critical bool
+	ctx context.Context
 }
 
 func authMatcher(p provider.Authenticator) (transport.AuthMethod){
 	var am transport.AuthMethod
 	switch p.Name(){
 	case "token":
-		a:= new(githttp.TokenAuth)
+		/*a:= new(githttp.TokenAuth)
 		a.Token = p.Value()
 		am = a
+		*/
+		a := new(githttp.BasicAuth)
+		a.Username="blahhhhh"
+		a.Password=p.Value()
 	case "basic":
 		a := new(githttp.BasicAuth)
 		a.Username = p.Values()[0]
@@ -95,6 +100,52 @@ func authMatcher(p provider.Authenticator) (transport.AuthMethod){
 		am = a
 	}
 	return am
+}
+
+func idealCloner(job *Job) (err error){
+	if err != nil {
+		return err
+	}
+	return
+}
+
+type Pool struct {
+	jobs chan Job
+	doneJobs chan Job
+	errJobs chan Job
+	worker func (context.Context, Job) (error)
+	crier func (context.Context, Job)
+	fixer func (context.Context, Job)
+	ctx context.Context
+	cancel context.CancelFunc
+	aciveJobs map[string]Job
+	activeJobsLock sync.Mutex
+	wg sync.WaitGroup
+	timeout time.Duration
+}
+
+func (p *Pool) Start(workers, criers, fixers uint) {
+
+}
+
+func (p *Pool) AddJob(job Job){
+
+}
+
+func (p *Pool) Stop(){
+
+}
+
+func (p *Pool) Wait(){
+
+}
+
+func (p *Pool) ActiveJobs() []Job{
+	return []Job{}
+}
+
+func NewPool() Pool{
+	return *new(Pool)
 }
 
 func cloner(jobs <-chan types.Repository, doneJobs, errJobs chan<- types.Repository, path string) {
@@ -112,7 +163,8 @@ func cloner(jobs <-chan types.Repository, doneJobs, errJobs chan<- types.Reposit
 			//timeWatchProbe(name)
 			//bw.WriteString(err.Error())
 			//job.output = bw.String()
-			//errJobs <- job
+			fmt.Println(job.Name, err)
+			errJobs <- job
 		} else {
 			//timeWatchProbe(name)
 			bw.WriteString(status)

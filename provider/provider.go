@@ -30,11 +30,6 @@ type Authenticator interface {
 	//Answer(string) error
 }
 
-type AuthBasic struct {
-	user, pass string
-	//otp
-}
-
 var providers map[string]ProviderFactory
 
 func init() {
